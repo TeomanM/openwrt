@@ -74,6 +74,14 @@ case "$FIRMWARE" in
 		ath11k_set_macflag
 		ath11k_remove_regdomain
 		;;
+	tplink,archer-ax72-v1)
+		# stock 2.4 GHz uses the label MAC
+		caldata_extract "0:ART" 0x1000 0x20000
+		label_mac=$(get_mac_binary "/tmp/tp_data/default-mac" 0)
+		[ -n "$label_mac" ] && ath11k_patch_mac "$label_mac" 0
+		ath11k_set_macflag
+		ath11k_remove_regdomain
+		;;
 	tplink,eap650-outdoor-v1)
 		caldata_from_file "/tmp/factory_data/radio" 0 0x20000
 		label_mac=$(get_mac_binary /tmp/factory_data/default-mac 0)
@@ -217,6 +225,14 @@ case "$FIRMWARE" in
 		ath11k_patch_mac $(macaddr_add $label_mac 2) 0
 		ath11k_remove_regdomain
 		ath11k_set_macflag
+		;;
+	tplink,archer-ax72-v1)
+		# stock 5 GHz uses label MAC - 1
+		caldata_extract "0:ART" 0x26800 0x20000
+		label_mac=$(get_mac_binary "/tmp/tp_data/default-mac" 0)
+		[ -n "$label_mac" ] && ath11k_patch_mac "$(macaddr_add "$label_mac" -1)" 0
+		ath11k_set_macflag
+		ath11k_remove_regdomain
 		;;
 	tplink,eap650-outdoor-v1)
 		caldata_from_file "/tmp/factory_data/radio1" 0 0x20000
