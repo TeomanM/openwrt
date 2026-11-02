@@ -53,6 +53,11 @@ define Build/mercusys-fwup
 	mv $@.new $@
 endef
 
+define Build/tplink-ax72-factory
+	$(TOPDIR)/scripts/tplink-ax72-factory.py --rootfs $@ --output $@.factory
+	mv $@.factory $@
+endef
+
 define Build/tplink-re700x-factory
 	$(TOPDIR)/scripts/tplink-re700x-factory.py --rootfs $@ --output $@.factory
 	mv $@.factory $@
@@ -358,6 +363,35 @@ endif
 endif
 endef
 TARGET_DEVICES += tplink_archer-ax55-v1
+
+define Device/tplink_archer-ax72-v1
+	$(call Device/FitImageLzma)
+	$(call Device/UbiFit)
+	DEVICE_VENDOR := TP-Link
+	DEVICE_MODEL := Archer AX72
+	DEVICE_VARIANT := v1
+	DEVICE_DTS_CONFIG := config@mp03.1
+	SOC := ipq5018
+	BLOCKSIZE := 128k
+	PAGESIZE := 2048
+	IMAGE_SIZE := 43008k
+	NAND_SIZE := 128m
+	IMAGES += factory.bin
+	IMAGE/factory.bin := append-ubi | tplink-ax72-factory
+	DEVICE_PACKAGES := ath11k-firmware-ipq5018-qcn6122 \
+		ath11k-firmware-qcn9074 \
+		ipq-wifi-tplink_archer-ax72-v1 \
+		kmod-ath11k-pci \
+		kmod-dsa-rtl8365mb \
+		kmod-usb-ledtrig-usbport
+ifneq ($(CONFIG_TARGET_ROOTFS_INITRAMFS),)
+ifeq ($(IB),)
+	ARTIFACTS := initramfs-factory.ubi
+	ARTIFACT/initramfs-factory.ubi := append-image-stage initramfs-uImage.itb | ubinize-kernel
+endif
+endif
+endef
+TARGET_DEVICES += tplink_archer-ax72-v1
 
 define Device/tplink_eap650-outdoor-v1
 	$(call Device/FitImage)
