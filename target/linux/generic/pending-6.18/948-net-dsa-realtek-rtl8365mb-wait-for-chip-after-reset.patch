@@ -1,0 +1,30 @@
+From: Teoman Madran <teoman@madran.me>
+Subject: [PATCH] net: dsa: realtek: rtl8365mb: wait for the chip to settle after reset
+
+rtl8365mb_reset_chip() returns as soon as the HW reset bit self-clears,
+but the chip keeps loading its internal defaults after that. On an
+RTL8367S (ver 0x00A0) behind an IPQ5018 this intermittently left CPU
+port traffic forwarded to no user port after a cold boot, until the
+driver was rebound.
+
+Realtek documents about 1 s for the chip to come out of reset, and the
+vendor driver waits 500 ms after the reset and again after init. Wait
+1 s after the reset before configuring the chip. With this, 10/10 cold
+boots plus warm and button reboots came up with working forwarding.
+
+Signed-off-by: Teoman Madran <teoman@madran.me>
+---
+--- a/drivers/net/dsa/realtek/rtl8365mb_main.c
++++ b/drivers/net/dsa/realtek/rtl8365mb_main.c
+@@ -3046,6 +3046,11 @@ static int rtl8365mb_setup(struct dsa_sw
+ 		goto out_error;
+ 	}
+ 
++	/* The reset bit clears before the chip has finished loading its
++	 * defaults. Realtek documents about 1 s for the chip to come up.
++	 */
++	msleep(1000);
++
+ 	ret = rtl8365mb_sds_probe_option(priv);
+ 	if (ret) {
+ 		dev_err(priv->dev, "failed to reset chip: %pe\n",
