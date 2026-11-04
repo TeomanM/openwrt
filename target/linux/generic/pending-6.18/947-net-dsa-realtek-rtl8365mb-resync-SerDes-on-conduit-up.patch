@@ -1,0 +1,232 @@
+From: Teoman Madran <teoman@madran.me>
+Subject: [PATCH] net: dsa: realtek: rtl8365mb: resync SerDes when conduit comes up
+
+The SerDes is set up in pcs_config() when the switch probes, before the
+conduit MAC drives the link. After a warm reboot the SerDes receiver can
+stay out of sync: switch->CPU traffic works but CPU->switch frames are
+dropped (seen on TP-Link Archer AX72 v1, IPQ5018 + RTL8367S over
+2500base-x). Rebinding the driver recovers it.
+
+Resetting the data path right when the conduit reports link up is not
+enough: the fixed link is reported up before the conduit SerDes drives a
+stable signal, and a reset a few milliseconds later can leave the
+receiver unlocked again. Instead, shortly after the conduit becomes
+operational, reset the data path, then read the SerDes signal detect,
+sync and link bits (as the vendor driver does) and reset again until they
+are all set. The reset is done even if the bits already read good: after
+a cold boot they can, while the receiver still drops every frame.
+
+Signed-off-by: Teoman Madran <teoman@madran.me>
+---
+--- a/drivers/net/dsa/realtek/rtl8365mb_main.c
++++ b/drivers/net/dsa/realtek/rtl8365mb_main.c
+@@ -102,6 +102,7 @@
+ #include <linux/if_bridge.h>
+ #include <linux/if_vlan.h>
+ #include <linux/phylink.h>
++#include <linux/workqueue.h>
+ 
+ #include "realtek.h"
+ #include "realtek-smi.h"
+@@ -297,7 +298,12 @@
+ #define RTL8365MB_SDS_REG_RESET			0x0003
+ #define   RTL8365MB_SDS_RESET_DEASSERT		0x7106
+ #define RTL8365MB_SDS_REG_LINK_STATUS		0x003d
++#define   RTL8365MB_SDS_LINK_STATUS_SIGDET_MASK	BIT(8)
+ #define   RTL8365MB_SDS_LINK_STATUS_LINK_MASK	BIT(4)
++#define   RTL8365MB_SDS_LINK_STATUS_SYNC_MASK	BIT(0)
++#define   RTL8365MB_SDS_LINK_STATUS_OK_MASK	(RTL8365MB_SDS_LINK_STATUS_SIGDET_MASK | \
++						 RTL8365MB_SDS_LINK_STATUS_LINK_MASK | \
++						 RTL8365MB_SDS_LINK_STATUS_SYNC_MASK)
+ 
+ /* The embedded SerDes can only be muxed to external interface 1 (MAC8),
+  * which is port 6.
+@@ -845,6 +851,9 @@
+  * @pcs: PCS for the SerDes external interface
+  * @sds_supported: SerDes tuning parameters match the chip option, so the
+  *                 SerDes interface modes can be advertised
++ * @sds_active: the SerDes has been configured by rtl8365mb_pcs_config()
++ * @sds_resync_work: checks the SerDes receiver after the conduit comes up
++ * @sds_resync_tries: data path resets done by the current @sds_resync_work run
+  *
+  * Private data for this driver.
+  */
+@@ -857,6 +866,9 @@
+ 	struct rtl8365mb_port ports[RTL8365MB_MAX_NUM_PORTS];
+ 	struct phylink_pcs pcs;
+ 	bool sds_supported;
++	bool sds_active;
++	struct delayed_work sds_resync_work;
++	unsigned int sds_resync_tries;
+ };
+ 
+ #define pcs_to_rtl8365mb(_pcs) container_of((_pcs), struct rtl8365mb, pcs)
+@@ -1305,6 +1317,20 @@
+ 				  RTL8365MB_PORT6_EGRESSBW_CTRL1_MASK);
+ }
+ 
++/* Reset the SerDes data path and resync its PLL */
++static int rtl8365mb_sds_reset_datapath(struct realtek_priv *priv)
++{
++	int ret;
++
++	ret = rtl8365mb_sds_write(priv, RTL8365MB_SDS_REG_BMCR,
++				  RTL8365MB_SDS_BMCR_DPRST_PHASE1);
++	if (ret)
++		return ret;
++
++	return rtl8365mb_sds_write(priv, RTL8365MB_SDS_REG_BMCR,
++				   RTL8365MB_SDS_BMCR_DPRST_PHASE2);
++}
++
+ static int rtl8365mb_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
+ 				phy_interface_t interface,
+ 				const unsigned long *advertising,
+@@ -1397,15 +1423,11 @@
+ 	 * This flushes the FIFOs and ensures a clean state for the link,
+ 	 * preventing silent drops and CRC errors.
+ 	 */
+-	ret = rtl8365mb_sds_write(priv, RTL8365MB_SDS_REG_BMCR,
+-				  RTL8365MB_SDS_BMCR_DPRST_PHASE1);
++	ret = rtl8365mb_sds_reset_datapath(priv);
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = rtl8365mb_sds_write(priv, RTL8365MB_SDS_REG_BMCR,
+-				  RTL8365MB_SDS_BMCR_DPRST_PHASE2);
+-	if (ret)
+-		return ret;
++	mb->sds_active = true;
+ 
+ 	/* Keep SGMII in-band autonegotiation disabled: the link parameters are
+ 	 * forced from rtl8365mb_pcs_link_up() instead.
+@@ -3201,7 +3223,9 @@
+ static void rtl8365mb_teardown(struct dsa_switch *ds)
+ {
+ 	struct realtek_priv *priv = ds->priv;
++	struct rtl8365mb *mb = priv->chip_data;
+ 
++	cancel_delayed_work_sync(&mb->sds_resync_work);
+ 	rtl8365mb_stats_teardown(priv);
+ 	rtl8365mb_irq_teardown(priv);
+ }
+@@ -3233,6 +3257,8 @@
+ 	return 0;
+ }
+ 
++static void rtl8365mb_sds_resync_work(struct work_struct *work);
++
+ static int rtl8365mb_detect(struct realtek_priv *priv)
+ {
+ 	struct rtl8365mb *mb = priv->chip_data;
+@@ -3268,6 +3294,7 @@
+ 
+ 	priv->num_ports = RTL8365MB_MAX_NUM_PORTS;
+ 	mb->priv = priv;
++	INIT_DELAYED_WORK(&mb->sds_resync_work, rtl8365mb_sds_resync_work);
+ 	mb->cpu.trap_port = RTL8365MB_MAX_NUM_PORTS;
+ 	mb->cpu.insert = RTL8365MB_CPU_INSERT_TO_ALL;
+ 	mb->cpu.position = RTL8365MB_CPU_POS_AFTER_SA;
+@@ -3284,11 +3311,102 @@
+ 	.mac_link_up = rtl8365mb_phylink_mac_link_up,
+ };
+ 
++/* The conduit reporting a fixed link up does not mean its SerDes already
++ * drives a stable signal, so give it time before checking our receiver.
++ */
++#define RTL8365MB_SDS_RESYNC_DELAY	msecs_to_jiffies(50)
++#define RTL8365MB_SDS_RESYNC_RETRY	msecs_to_jiffies(100)
++#define RTL8365MB_SDS_RESYNC_MAX_TRIES	10
++
++static int rtl8365mb_sds_rx_status(struct realtek_priv *priv, u16 *status)
++{
++	int ret;
++
++	/* The status bits latch low: read twice to get the current state */
++	ret = rtl8365mb_sds_read(priv, RTL8365MB_SDS_REG_LINK_STATUS, status);
++	if (ret)
++		return ret;
++
++	return rtl8365mb_sds_read(priv, RTL8365MB_SDS_REG_LINK_STATUS, status);
++}
++
++/* The SerDes is configured when the switch probes, which can happen before the
++ * conduit drives a valid signal. After a warm reboot the SerDes receiver can
++ * then stay out of sync: the fixed link reports up and frames from the switch
++ * reach the CPU, but frames from the CPU are never forwarded. Once the conduit
++ * is operational, reset the data path and repeat until the receiver reports
++ * signal, sync and link.
++ */
++static void rtl8365mb_sds_resync_work(struct work_struct *work)
++{
++	struct rtl8365mb *mb = container_of(to_delayed_work(work),
++					    struct rtl8365mb, sds_resync_work);
++	struct realtek_priv *priv = mb->priv;
++	u16 status;
++	int ret;
++
++	ret = rtl8365mb_sds_rx_status(priv, &status);
++	if (ret) {
++		dev_err(priv->dev, "failed to read SerDes status: %d\n", ret);
++		return;
++	}
++
++	/* The status bits can read good while the receiver still drops every
++	 * frame from the conduit (seen after a cold boot), so always reset the
++	 * data path once, then retry until the receiver reports a lock.
++	 */
++	if (mb->sds_resync_tries &&
++	    (status & RTL8365MB_SDS_LINK_STATUS_OK_MASK) ==
++	    RTL8365MB_SDS_LINK_STATUS_OK_MASK) {
++		dev_info(priv->dev, "SerDes rx ok (status 0x%04x, %u resets)\n",
++			 status, mb->sds_resync_tries);
++		return;
++	}
++
++	if (mb->sds_resync_tries >= RTL8365MB_SDS_RESYNC_MAX_TRIES) {
++		dev_err(priv->dev, "SerDes rx not locked (status 0x%04x), giving up\n",
++			status);
++		return;
++	}
++
++	dev_info(priv->dev, "SerDes rx status 0x%04x, resetting\n", status);
++
++	ret = rtl8365mb_sds_reset_datapath(priv);
++	if (ret) {
++		dev_err(priv->dev, "failed to reset SerDes data path: %d\n", ret);
++		return;
++	}
++
++	mb->sds_resync_tries++;
++	schedule_delayed_work(&mb->sds_resync_work, RTL8365MB_SDS_RESYNC_RETRY);
++}
++
++static void rtl8365mb_conduit_state_change(struct dsa_switch *ds,
++					   const struct net_device *conduit,
++					   bool operational)
++{
++	struct realtek_priv *priv = ds->priv;
++	struct rtl8365mb *mb = priv->chip_data;
++
++	if (!mb->sds_active)
++		return;
++
++	if (!operational) {
++		cancel_delayed_work(&mb->sds_resync_work);
++		return;
++	}
++
++	mb->sds_resync_tries = 0;
++	mod_delayed_work(system_wq, &mb->sds_resync_work,
++			 RTL8365MB_SDS_RESYNC_DELAY);
++}
++
+ static const struct dsa_switch_ops rtl8365mb_switch_ops = {
+ 	.get_tag_protocol = rtl8365mb_get_tag_protocol,
+ 	.change_tag_protocol = rtl8365mb_change_tag_protocol,
+ 	.setup = rtl8365mb_setup,
+ 	.teardown = rtl8365mb_teardown,
++	.conduit_state_change = rtl8365mb_conduit_state_change,
+ 	.phylink_get_caps = rtl8365mb_phylink_get_caps,
+ 	.port_bridge_join = rtl83xx_port_bridge_join,
+ 	.port_bridge_leave = rtl83xx_port_bridge_leave,
