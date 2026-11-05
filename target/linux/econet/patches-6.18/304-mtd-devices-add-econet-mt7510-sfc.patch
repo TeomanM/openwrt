@@ -1,0 +1,30 @@
+From: OpenWrt
+Subject: [PATCH] mtd: devices: add EcoNet MT7510 SPI NOR controller
+
+---
+diff --git a/drivers/mtd/devices/Kconfig b/drivers/mtd/devices/Kconfig
+--- a/drivers/mtd/devices/Kconfig	2026-11-05 15:34:27.360401310 +0300
++++ b/drivers/mtd/devices/Kconfig	2026-11-05 15:34:27.368496038 +0300
+@@ -120,6 +120,14 @@
+ 	  registered by bcma as platform devices. This enables driver for
+ 	  serial flash memories.
+ 
++config MTD_ECONET_SFC
++	tristate "EcoNet MT7510 SPI NOR flash controller"
++	depends on ECONET || COMPILE_TEST
++	help
++	  Support for the SPI NOR flash controller of the EcoNet/TrendChip
++	  MT7510 SoC, which has a fixed command interface and a memory
++	  mapped read window.
++
+ config MTD_SLRAM
+ 	tristate "Uncached system RAM"
+ 	help
+diff --git a/drivers/mtd/devices/Makefile b/drivers/mtd/devices/Makefile
+--- a/drivers/mtd/devices/Makefile	2026-11-05 15:34:27.360429840 +0300
++++ b/drivers/mtd/devices/Makefile	2026-11-05 15:34:27.368525288 +0300
+@@ -22,3 +22,4 @@
+ 
+ 
+ CFLAGS_docg3.o			+= -I$(src)
++obj-$(CONFIG_MTD_ECONET_SFC)	+= econet-sfc.o

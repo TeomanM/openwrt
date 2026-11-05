@@ -1,0 +1,2 @@
+obj-m += mt7510-eth.o
+mt7510-eth-y := mt7510_eth.o
