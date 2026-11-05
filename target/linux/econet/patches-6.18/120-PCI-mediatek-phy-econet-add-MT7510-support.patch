@@ -1,0 +1,246 @@
+From: TeomanM <teoman@madran.me>
+Subject: PCI: mediatek: phy: econet: add MT7510 support
+
+The MT7510 PCIe controller uses the MediaTek v1 register layout (shared
+config window at 0x20/0x24, per-port PERST# in SYS_CFG, link status at
+port + 0x50), with these differences:
+
+- config address is bus[31:24] devfn[23:16] reg[11:2], and the window
+  only takes 32-bit accesses (byte reads return the wrong lane);
+- config offsets above 0x3ff hang the bus;
+- both PERST# bits must be released for the RC1 link to train;
+- port 1 interrupt enable is bit 26; resets and PERST# pinmux are in the
+  SCU.
+
+Its PHY is one block for both ports that needs the PLL programmed first.
+
+The MT7592 (MT7603 die) found on these boards also needs a chip LDO
+register set before its firmware will start.
+
+Sequences follow the vendor 2.6.36 driver (pci-tc3162u.c, pcie-phy.c).
+
+--- a/drivers/phy/phy-econet-pcie.c
++++ b/drivers/phy/phy-econet-pcie.c
+@@ -83,6 +83,34 @@
+ 	{ /* sentinel */ }
+ };
+ 
++/*
++ * MT7510: one PHY block serves both ports (bank 0x000 = port 0,
++ * 0x100 = port 1, 0x400 = shared PLL). Sequence from the vendor
++ * init_60901() for a 25 MHz crystal: take both ports down, set up the
++ * PLL and SSC, then enable both ports again.
++ */
++static const struct en75_phy_op mt7510_phy[] = {
++	{ 0x000, BIT(4), 1 },			/* port 0 force PHY enable */
++	{ 0x100, BIT(4), 1 },			/* port 1 force PHY enable */
++	{ 0x000, BIT(5), 0 },			/* port 0 PHY off */
++	{ 0x100, BIT(5), 0 },			/* port 1 PHY off */
++	{ 0x400, BIT(8), 1 },			/* force xtal type */
++	{ 0x400, GENMASK(10, 9), 0 },		/* xtal type: 25 MHz */
++	{ 0x490, GENMASK(15, 12), 0xa },	/* PLL_IR */
++	{ 0x4ac, GENMASK(18, 16), 1 },		/* PLL_BR */
++	{ 0x49c, GENMASK(30, 16), 0x1900 },	/* LCDDS_PCW_NCPO */
++	{ 0x49c, BIT(31), 0 },			/* latch PCW */
++	{ 0x49c, BIT(31), 1 },
++	{ 0x4a4, GENMASK(15, 0), 0x18d },	/* SSC period */
++	{ 0x4a8, GENMASK(11, 0), 0x4a },	/* SSC delta */
++	{ 0x4a8, GENMASK(27, 16), 0x4a },	/* SSC delta1 */
++	{ 0x400, BIT(12), 1 },			/* mstck_25m */
++	{ 0x400, BIT(11), 1 },			/* force mstck_25m */
++	{ 0x000, BIT(5), 1 },			/* port 0 PHY on */
++	{ 0x100, BIT(5), 1 },			/* port 1 PHY on */
++	{ /* sentinel */ }
++};
++
+ static int en75_pcie_phy_init(struct phy *phy)
+ {
+ 	struct en7528_pcie_phy *ephy = phy_get_drvdata(phy);
+@@ -164,6 +192,7 @@
+ 	{ .compatible = "econet,en7528-pcie-gen2", .data = en7528_phy_gen2 },
+ 	{ .compatible = "econet,en751221-pcie-gen1", .data = en7528_phy_gen1 },
+ 	{ .compatible = "econet,en751221-pcie-gen2", .data = en751221_phy_gen2 },
++	{ .compatible = "econet,mt7510-pcie-phy", .data = mt7510_phy },
+ 	{ /* sentinel */ }
+ };
+ MODULE_DEVICE_TABLE(of, en75_pcie_phy_ids);
+--- a/drivers/pci/controller/pcie-mediatek.c
++++ b/drivers/pci/controller/pcie-mediatek.c
+@@ -166,6 +166,7 @@
+ 	MTK_PCIE_NO_MSI = BIT(2),
+ 	MTK_PCIE_SKIP_RSTB = BIT(3),
+ 	MTK_PCIE_RETRAIN = BIT(4),
++	MTK_PCIE_NO_SYS_CK = BIT(5),
+ };
+ 
+ /**
+@@ -916,6 +917,103 @@
+ 	.write = pci_generic_config_write,
+ };
+ 
++/* MT7510 config address: bus[31:24] devfn[23:16] reg[11:2] */
++static void __iomem *mtk_pcie_map_bus_mt7510(struct pci_bus *bus,
++					     unsigned int devfn, int where)
++{
++	struct mtk_pcie *pcie = bus->sysdata;
++	struct mtk_pcie_port *port;
++	bool found = false;
++
++	/* Accesses above 0x3ff hang the bus (seen walking the root port's AER chain) */
++	if (where >= 0x400)
++		return NULL;
++
++	/* Only touch root ports whose link came up */
++	if (pci_is_root_bus(bus)) {
++		list_for_each_entry(port, &pcie->ports, list)
++			if (PCI_FUNC(devfn) == 0 && port->slot == PCI_SLOT(devfn))
++				found = true;
++		if (!found)
++			return NULL;
++	}
++
++	writel((bus->number << 24) | (devfn << 16) | (where & 0xffc),
++	       pcie->base + PCIE_CFG_ADDR);
++
++	return pcie->base + PCIE_CFG_DATA + (where & 3);
++}
++
++/* The config window only takes 32-bit accesses */
++static struct pci_ops mtk_pcie_ops_mt7510 = {
++	.map_bus = mtk_pcie_map_bus_mt7510,
++	.read  = pci_generic_config_read32,
++	.write = pci_generic_config_write32,
++};
++
++#define MT7510_SCU_PCIC		0x88
++#define MT7510_PCIE1_REFCLK_EN	BIT(22)
++#define MT7510_SCU_RST		0x834
++#define MT7510_PCIE_RST		(BIT(26) | BIT(27) | BIT(29))
++#define MT7510_SCU_GPIO_SHARE	0x860
++#define MT7510_PERST_PINMUX	(BIT(19) | BIT(20))
++#define MT7510_PORT_INT_EN(x)	((x) ? BIT(26) : BIT(20))
++
++static int mtk_pcie_startup_port_mt7510(struct mtk_pcie_port *port)
++{
++	struct mtk_pcie *pcie = port->pcie;
++	struct regmap *scu;
++	u32 val;
++	int err;
++
++	/* SCU setup and MAC reset are shared: do them once, for the first port */
++	if (port == list_first_entry(&pcie->ports, struct mtk_pcie_port, list)) {
++		scu = syscon_regmap_lookup_by_phandle(pcie->dev->of_node,
++						      "econet,scu");
++		if (IS_ERR(scu))
++			return dev_err_probe(pcie->dev, PTR_ERR(scu),
++					     "missing econet,scu\n");
++
++		regmap_set_bits(scu, MT7510_SCU_PCIC, MT7510_PCIE1_REFCLK_EN);
++		usleep_range(1000, 2000);
++
++		/* Route PERST# to the pins */
++		regmap_set_bits(scu, MT7510_SCU_GPIO_SHARE, MT7510_PERST_PINMUX);
++
++		regmap_clear_bits(scu, MT7510_SCU_RST, MT7510_PCIE_RST);
++		usleep_range(1000, 2000);
++		regmap_set_bits(scu, MT7510_SCU_RST, MT7510_PCIE_RST);
++		msleep(100);
++		regmap_clear_bits(scu, MT7510_SCU_RST, MT7510_PCIE_RST);
++		usleep_range(1000, 2000);
++	}
++
++	/*
++	 * Release PERST#. Like the vendor driver, clear both port bits:
++	 * the RC1 link does not train while bit 1 is still set.
++	 */
++	val = readl(pcie->base + PCIE_SYS_CFG);
++	val &= ~(PCIE_PORT_PERST(0) | PCIE_PORT_PERST(1));
++	writel(val, pcie->base + PCIE_SYS_CFG);
++
++	/* The vendor driver waits 250 ms before checking the link */
++	err = readl_poll_timeout(port->base + PCIE_LINK_STATUS, val,
++				 !!(val & PCIE_PORT_LINKUP), 1000,
++				 500 * USEC_PER_MSEC);
++	if (err)
++		return -ETIMEDOUT;
++
++	val = readl(pcie->base + PCIE_INT_ENABLE);
++	val |= MT7510_PORT_INT_EN(port->slot);
++	writel(val, pcie->base + PCIE_INT_ENABLE);
++
++	writel(PCIE_BAR_MAP_MAX | PCIE_BAR_ENABLE,
++	       port->base + PCIE_BAR0_SETUP);
++	writel(PCIE_CLASS_CODE | PCIE_REVISION_ID, port->base + PCIE_CLASS);
++
++	return 0;
++}
++
+ static int mtk_pcie_startup_port(struct mtk_pcie_port *port)
+ {
+ 	struct mtk_pcie *pcie = port->pcie;
+@@ -1126,7 +1224,10 @@
+ 	}
+ 
+ 	snprintf(name, sizeof(name), "sys_ck%d", slot);
+-	port->sys_ck = devm_clk_get(dev, name);
++	if (pcie->soc->quirks & MTK_PCIE_NO_SYS_CK)
++		port->sys_ck = devm_clk_get_optional(dev, name);
++	else
++		port->sys_ck = devm_clk_get(dev, name);
+ 	if (IS_ERR(port->sys_ck)) {
+ 		dev_err(dev, "failed to get sys_ck%d clock\n", slot);
+ 		return PTR_ERR(port->sys_ck);
+@@ -1447,9 +1548,53 @@
+ 	.quirks = MTK_PCIE_RETRAIN,
+ };
+ 
++/*
++ * MT7592 (MT7603 die) on MT7510 boards: the vendor driver sets a chip LDO
++ * register before the Wi-Fi driver loads (preConfigLDO). Without it the
++ * MCU never answers the firmware start command.
++ */
++#define MT7603_PCIE_REMAP_1	0x2500
++#define MT7603_REMAP_WINDOW	0x40000
++
++static void mt7510_mt7592_ldo_fixup(struct pci_dev *dev)
++{
++	struct pci_host_bridge *host = pci_find_host_bridge(dev->bus);
++	void __iomem *base;
++	u32 remap;
++	u16 cmd;
++
++	if (!host || host->ops != &mtk_pcie_ops_mt7510)
++		return;
++
++	base = pci_iomap(dev, 0, 0);
++	if (!base)
++		return;
++
++	pci_read_config_word(dev, PCI_COMMAND, &cmd);
++	pci_write_config_word(dev, PCI_COMMAND, cmd | PCI_COMMAND_MEMORY);
++
++	remap = readl(base + MT7603_PCIE_REMAP_1);
++	writel(0x50000000, base + MT7603_PCIE_REMAP_1);
++	writel(0x5, base + MT7603_REMAP_WINDOW + 0x12498);
++	writel(0x80, base + MT7603_REMAP_WINDOW + 0x12040);
++	writel(remap, base + MT7603_PCIE_REMAP_1);
++
++	pci_write_config_word(dev, PCI_COMMAND, cmd);
++	pci_iounmap(dev, base);
++}
++DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_MEDIATEK, 0x7603,
++			mt7510_mt7592_ldo_fixup);
++
++static const struct mtk_pcie_soc mtk_pcie_soc_mt7510 = {
++	.ops = &mtk_pcie_ops_mt7510,
++	.startup = mtk_pcie_startup_port_mt7510,
++	.quirks = MTK_PCIE_NO_MSI | MTK_PCIE_NO_SYS_CK,
++};
++
+ static const struct of_device_id mtk_pcie_ids[] = {
+ 	{ .compatible = "airoha,an7583-pcie", .data = &mtk_pcie_soc_an7583 },
+ 	{ .compatible = "econet,en7528-pcie", .data = &mtk_pcie_soc_en7528 },
++	{ .compatible = "econet,mt7510-pcie", .data = &mtk_pcie_soc_mt7510 },
+ 	{ .compatible = "mediatek,mt2701-pcie", .data = &mtk_pcie_soc_v1 },
+ 	{ .compatible = "mediatek,mt7623-pcie", .data = &mtk_pcie_soc_v1 },
+ 	{ .compatible = "mediatek,mt2712-pcie", .data = &mtk_pcie_soc_mt2712 },

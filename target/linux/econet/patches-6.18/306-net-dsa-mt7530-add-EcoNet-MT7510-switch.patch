@@ -1,0 +1,121 @@
+From: TeomanM <teoman@madran.me>
+Subject: [PATCH] net: dsa: mt7530: add EcoNet MT7510 switch
+
+The MT7510 has a memory-mapped MT7530 core (chip ID 0x7530 rev 2) with
+Fast Ethernet PHYs on ports 0-4 (PHY addresses 8-12) and the frame
+engine on port 6. Register access matches the EN7528 profile. The
+bootloader resets the switch and tunes the PHYs, so setup skips the
+reset, which also makes the reset line optional for MMIO switches.
+
+---
+--- a/drivers/net/dsa/mt7530.h
++++ b/drivers/net/dsa/mt7530.h
+@@ -22,6 +22,7 @@
+ 	ID_EN7581 = 4,
+ 	ID_AN7583 = 5,
+ 	ID_EN7528 = 6,
++	ID_MT7510 = 7,
+ };
+ 
+ #define	NUM_TRGMII_CTRL			5
+--- a/drivers/net/dsa/mt7530.c
++++ b/drivers/net/dsa/mt7530.c
+@@ -2894,6 +2894,28 @@
+ 	}
+ }
+ 
++static void mt7510_mac_port_get_caps(struct dsa_switch *ds, int port,
++				     struct phylink_config *config)
++{
++	switch (port) {
++	/* Ports 0-4 are connected to internal Fast Ethernet PHYs */
++	case 0 ... 4:
++		__set_bit(PHY_INTERFACE_MODE_INTERNAL,
++			  config->supported_interfaces);
++
++		config->mac_capabilities |= MAC_10 | MAC_100;
++		break;
++
++	/* Port 6 is connected to the SoC's frame engine at 1000 Mbps */
++	case 6:
++		__set_bit(PHY_INTERFACE_MODE_INTERNAL,
++			  config->supported_interfaces);
++
++		config->mac_capabilities |= MAC_1000FD;
++		break;
++	}
++}
++
+ static void en7528_mac_port_get_caps(struct dsa_switch *ds, int port,
+ 				     struct phylink_config *config)
+ {
+@@ -3118,7 +3140,7 @@
+ 	 * phylink disables EEE on these PHYs and refuses to enable it from
+ 	 * userspace.
+ 	 */
+-	if (priv->id != ID_EN7528 &&
++	if (priv->id != ID_EN7528 && priv->id != ID_MT7510 &&
+ 	    config->mac_capabilities & (MAC_100FD | MAC_1000FD)) {
+ 		u32 eeecr = mt7530_read(priv, MT753X_PMEEECR_P(port));
+ 
+@@ -3276,7 +3298,7 @@
+ 	 * interface is up.
+ 	 */
+ 	if (priv->id != ID_MT7530 && priv->id != ID_MT7621 &&
+-	    priv->id != ID_EN7528)
++	    priv->id != ID_EN7528 && priv->id != ID_MT7510)
+ 		return;
+ 
+ 	mask = BIT(cpu_dp->index);
+@@ -3367,6 +3389,15 @@
+ 	return mt7531_setup_common(ds);
+ }
+ 
++/*
++ * MT7510: the bootloader resets the switch and tunes the FE PHYs; a reset
++ * here would lose that tuning, so only do the common configuration.
++ */
++static int mt7510_setup(struct dsa_switch *ds)
++{
++	return mt7531_setup_common(ds);
++}
++
+ const struct dsa_switch_ops mt7530_switch_ops = {
+ 	.get_tag_protocol	= mtk_get_tag_protocol,
+ 	.setup			= mt753x_setup,
+@@ -3490,6 +3521,16 @@
+ 		.phy_write_c45 = mt7531_ind_c45_phy_write,
+ 		.mac_port_get_caps = en7528_mac_port_get_caps,
+ 	},
++	[ID_MT7510] = {
++		.id = ID_MT7510,
++		.pcs_ops = &mt7530_pcs_ops,
++		.sw_setup = mt7510_setup,
++		.phy_read_c22 = mt7531_ind_c22_phy_read,
++		.phy_write_c22 = mt7531_ind_c22_phy_write,
++		.phy_read_c45 = mt7531_ind_c45_phy_read,
++		.phy_write_c45 = mt7531_ind_c45_phy_write,
++		.mac_port_get_caps = mt7510_mac_port_get_caps,
++	},
+ };
+ EXPORT_SYMBOL_GPL(mt753x_table);
+ 
+--- a/drivers/net/dsa/mt7530-mmio.c
++++ b/drivers/net/dsa/mt7530-mmio.c
+@@ -14,6 +14,7 @@
+ 	{ .compatible = "airoha,an7583-switch", .data = &mt753x_table[ID_AN7583], },
+ 	{ .compatible = "airoha,en7581-switch", .data = &mt753x_table[ID_EN7581], },
+ 	{ .compatible = "econet,en7528-switch", .data = &mt753x_table[ID_EN7528], },
++	{ .compatible = "econet,mt7510-switch", .data = &mt753x_table[ID_MT7510], },
+ 	{ .compatible = "mediatek,mt7988-switch", .data = &mt753x_table[ID_MT7988], },
+ 	{ /* sentinel */ },
+ };
+@@ -45,7 +46,7 @@
+ 	if (ret)
+ 		return ret;
+ 
+-	priv->rstc = devm_reset_control_get(&pdev->dev, NULL);
++	priv->rstc = devm_reset_control_get_optional(&pdev->dev, NULL);
+ 	if (IS_ERR(priv->rstc)) {
+ 		dev_err(&pdev->dev, "Couldn't get our reset line\n");
+ 		return PTR_ERR(priv->rstc);

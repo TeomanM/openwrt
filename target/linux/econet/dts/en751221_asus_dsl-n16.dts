@@ -1,0 +1,347 @@
+// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+/dts-v1/;
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/input.h>
+#include <dt-bindings/leds/common.h>
+
+#include "en751221.dtsi"
+
+/ {
+	model = "ASUS DSL-N16";
+	compatible = "asus,dsl-n16", "econet,en751221";
+
+	aliases {
+		led-boot = &led_power;
+		led-failsafe = &led_power;
+		led-running = &led_power;
+		led-upgrade = &led_power;
+	};
+
+	memory@0 {
+		device_type = "memory";
+		reg = <0x00000000 0x4000000>;
+	};
+
+	chosen {
+		stdout-path = "/serial@1fbf0000:115200";
+		linux,usable-memory-range = <0x00020000 0x03fe0000>;
+	};
+
+	keys {
+		compatible = "gpio-keys-polled";
+		poll-interval = <20>;
+
+		key-reset {
+			label = "reset";
+			gpios = <&gpio1 0 GPIO_ACTIVE_LOW>;	/* GPIO 32 */
+			linux,code = <KEY_RESTART>;
+		};
+
+		key-wps {
+			label = "wps";
+			gpios = <&gpio1 17 GPIO_ACTIVE_LOW>;	/* GPIO 49 */
+			linux,code = <KEY_WPS_BUTTON>;
+		};
+	};
+
+	leds {
+		compatible = "gpio-leds";
+
+		led_power: led-power {
+			function = LED_FUNCTION_POWER;
+			color = <LED_COLOR_ID_GREEN>;
+			gpios = <&gpio0 21 GPIO_ACTIVE_HIGH>;
+		};
+
+		led-dsl {
+			label = "green:dsl";
+			gpios = <&gpio0 15 GPIO_ACTIVE_HIGH>;
+		};
+
+		led-wan {
+			function = LED_FUNCTION_WAN;
+			color = <LED_COLOR_ID_GREEN>;
+			gpios = <&gpio0 16 GPIO_ACTIVE_HIGH>;
+		};
+	};
+
+	/*
+	 * LAN1-4 LEDs: GPIO 42-45, shared with the switch port LED outputs
+	 * (SCU GPIO share bits 9-12). The switch drives them by default.
+	 */
+	leds-lan {
+		compatible = "econet,mt7510-mux-leds";
+		econet,scu = <&scuclk>;
+
+		led-lan1 {
+			function = LED_FUNCTION_LAN;
+			function-enumerator = <1>;
+			color = <LED_COLOR_ID_GREEN>;
+			gpios = <&gpio1 10 GPIO_ACTIVE_LOW>;
+			econet,mux-bit = <9>;
+		};
+
+		led-lan2 {
+			function = LED_FUNCTION_LAN;
+			function-enumerator = <2>;
+			color = <LED_COLOR_ID_GREEN>;
+			gpios = <&gpio1 11 GPIO_ACTIVE_LOW>;
+			econet,mux-bit = <10>;
+		};
+
+		led-lan3 {
+			function = LED_FUNCTION_LAN;
+			function-enumerator = <3>;
+			color = <LED_COLOR_ID_GREEN>;
+			gpios = <&gpio1 12 GPIO_ACTIVE_LOW>;
+			econet,mux-bit = <11>;
+		};
+
+		led-lan4 {
+			function = LED_FUNCTION_LAN;
+			function-enumerator = <4>;
+			color = <LED_COLOR_ID_GREEN>;
+			gpios = <&gpio1 13 GPIO_ACTIVE_LOW>;
+			econet,mux-bit = <12>;
+		};
+	};
+};
+
+/*
+ * MT7510 has no EN7523-style SPI controller; the SPI NOR (GD25Q128) sits on
+ * the older TC3162 flash controller with a memory mapped read window.
+ */
+/delete-node/ &nand;
+
+&spi_ctrl {
+	status = "disabled";
+};
+
+/ {
+	flash@1fbc0000 {
+		compatible = "econet,mt7510-sfc";
+		reg = <0x1fbc0000 0x100>, <0x1c000000 0x1000000>;
+
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			partition@0 {
+				label = "bootloader";
+				reg = <0x0 0x10000>;
+				read-only;
+
+				nvmem-layout {
+					compatible = "fixed-layout";
+					#address-cells = <1>;
+					#size-cells = <1>;
+
+					eeprom_bootloader_fb00: eeprom@fb00 {
+						/* MT7592 */
+						reg = <0xfb00 0x400>;
+					};
+
+					macaddr_bootloader_ff48: macaddr@ff48 {
+						compatible = "mac-base";
+						reg = <0xff48 0x6>;
+						#nvmem-cell-cells = <1>;
+					};
+				};
+			};
+
+			partition@10000 {
+				label = "romfile";
+				reg = <0x10000 0x10000>;
+				read-only;
+			};
+
+			/* Stock "tclinux" (0x20000-0xec0000) + "jffs2" (0xec0000-0xfc0000) */
+			partition@20000 {
+				label = "firmware";
+				reg = <0x20000 0xfa0000>;
+			};
+
+			/* tclinux-trx pads header + kernel to 4 MiB */
+			partition@420000 {
+				label = "rootfs";
+				reg = <0x420000 0xba0000>;
+				linux,rootfs;
+			};
+
+			partition@fc0000 {
+				label = "reservearea";
+				reg = <0xfc0000 0x40000>;
+				read-only;
+			};
+		};
+	};
+};
+
+&gmac0 {
+	status = "okay";
+	nvmem-cells = <&macaddr_bootloader_ff48 0>;
+	nvmem-cell-names = "mac-address";
+};
+
+/*
+ * MT7510 PCIe is not the EN751221/EN7528 controller: it has the MediaTek v1
+ * layout (shared registers at 0x1fb80000, root ports at 0x1fb82000 and
+ * 0x1fb83000) and one PHY block at 0x1faf2000 for both ports. Replace the
+ * dtsi nodes. The MT7592 sits on RC1 (stock log: RC0 link down).
+ */
+&pcie_phy0 {
+	compatible = "econet,mt7510-pcie-phy";
+	status = "okay";
+};
+
+&pcie_phy1 {
+	status = "disabled";
+};
+
+&intc {
+	#address-cells = <0>;
+};
+
+/ {
+	pcie@1fb80000 {
+		compatible = "econet,mt7510-pcie";
+		device_type = "pci";
+		reg = <0x1fb80000 0x100>, <0x1fb82000 0x1000>,
+		      <0x1fb83000 0x1000>;
+		reg-names = "subsys", "port0", "port1";
+		#address-cells = <3>;
+		#size-cells = <2>;
+		econet,scu = <&scuclk>;
+		phys = <&pcie_phy0>;
+		phy-names = "pcie-phy1";
+		bus-range = <0x00 0xff>;
+		ranges = <0x81000000 0 0x00000000 0x1f600000 0 0x00010000>,
+			 <0x82000000 0 0x20000000 0x20000000 0 0x10000000>;
+
+		pcie@1,0 {
+			reg = <0x0800 0 0 0 0>;
+			device_type = "pci";
+			#address-cells = <3>;
+			#size-cells = <2>;
+			#interrupt-cells = <1>;
+			ranges;
+			interrupt-map-mask = <0 0 0 0>;
+			/* PCIe INTx reaches the intc on line 23 (seen pending), not 24 */
+			interrupt-map = <0 0 0 0 &intc 23>;
+
+			wifi@0,0 {
+				compatible = "mediatek,mt76";
+				reg = <0x0000 0 0 0 0>;
+				nvmem-cells = <&eeprom_bootloader_fb00>,
+					      <&macaddr_bootloader_ff48 1>;
+				nvmem-cell-names = "eeprom", "mac-address";
+
+				/* Wi-Fi LED hangs off the MT7592's LED pin */
+				led {
+					led-active-low;
+				};
+			};
+		};
+	};
+};
+
+/*
+ * MT7510 feeds GDMA1 (LAN) from the old PDMA engine, not QDMA, so it needs
+ * its own driver (kmod-mt7510-eth). PDMA interrupt = MAC_INT (21). Only the
+ * frame engine is reset; the switch keeps the bootloader's PHY setup.
+ */
+&ethernet {
+	compatible = "econet,mt7510-eth";
+	/* the switch at 0x1fb58000 has its own node */
+	reg = <0x1fb50000 0x8000>;
+	interrupts = <21>;
+	resets = <&scuclk EN751221_FE_QDMA1_RST>;
+	reset-names = "fe";
+};
+
+/* The MT7530 core is memory mapped on MT7510, not on MDIO */
+/delete-node/ &mdio;
+
+/ {
+	/*
+	 * MT7530 core (chip ID 0x7530 rev 2). Ports 0-3 = LAN1-4 with FE PHYs
+	 * at 8-11 (port 4 / PHY 12 has no socket), port 6 = frame engine.
+	 */
+	switch@1fb58000 {
+		compatible = "econet,mt7510-switch";
+		reg = <0x1fb58000 0x8000>;
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				label = "lan1";
+				phy-handle = <&swphy0>;
+				phy-mode = "internal";
+			};
+
+			port@1 {
+				reg = <1>;
+				label = "lan2";
+				phy-handle = <&swphy1>;
+				phy-mode = "internal";
+			};
+
+			port@2 {
+				reg = <2>;
+				label = "lan3";
+				phy-handle = <&swphy2>;
+				phy-mode = "internal";
+			};
+
+			port@3 {
+				reg = <3>;
+				label = "lan4";
+				phy-handle = <&swphy3>;
+				phy-mode = "internal";
+			};
+
+			port@6 {
+				reg = <6>;
+				ethernet = <&gmac0>;
+				phy-mode = "internal";
+
+				fixed-link {
+					speed = <1000>;
+					full-duplex;
+					pause;
+				};
+			};
+		};
+
+		mdio {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			swphy0: ethernet-phy@8 {
+				reg = <8>;
+			};
+
+			swphy1: ethernet-phy@9 {
+				reg = <9>;
+			};
+
+			swphy2: ethernet-phy@10 {
+				reg = <10>;
+			};
+
+			swphy3: ethernet-phy@11 {
+				reg = <11>;
+			};
+		};
+	};
+};
+
+/* MT7510 CPU timer runs at 800 MHz / 3 (stock CPUTMR_CLK), not 200 MHz */
+&hpt_clock {
+	clock-frequency = <266666667>;
+};

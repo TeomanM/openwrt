@@ -7,6 +7,7 @@ econet_setup_interfaces()
 	local board="$1"
 
 	case "$board" in
+	asus,dsl-n16|\
 	dasan,h660gm-a-airtel|\
 	dasan,h660gm-a-generic|\
 	econet,en7528-generic|\
