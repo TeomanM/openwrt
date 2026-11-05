@@ -1,0 +1,148 @@
+diff --color -ru a/arch/mips/econet/init.c b/arch/mips/econet/init.c
+--- a/arch/mips/econet/init.c	2026-11-05 10:36:28.451768292 +0300
++++ b/arch/mips/econet/init.c	2026-11-05 10:36:28.460593716 +0300
+@@ -28,6 +28,55 @@
+ #endif
+ #define UART_REG_SHIFT		2
+ 
++
++/* DSL-N16 bring-up debug: show boot stage as binary on LEDs.
++ * bit0 = DSL (GPIO15), bit1 = Internet (GPIO16), bit2 = Power (GPIO21).
++ * All active high. Registers per gpio-en7523 binding of gpio0. */
++#define DBG_GPIO_DATA	((void __iomem *)CKSEG1ADDR(0x1fbf0204))
++#define DBG_GPIO_DIR0	((void __iomem *)CKSEG1ADDR(0x1fbf0200))
++#define DBG_GPIO_DIR1	((void __iomem *)CKSEG1ADDR(0x1fbf0220))
++#define DBG_GPIO_OE	((void __iomem *)CKSEG1ADDR(0x1fbf0214))
++
++static void dbg_led(unsigned int gpio, int on)
++{
++	void __iomem *dir = gpio < 16 ? DBG_GPIO_DIR0 : DBG_GPIO_DIR1;
++	u32 v;
++
++	iowrite32(ioread32(dir) | BIT((gpio % 16) * 2), dir);
++	iowrite32(ioread32(DBG_GPIO_OE) | BIT(gpio), DBG_GPIO_OE);
++	v = ioread32(DBG_GPIO_DATA);
++	v = on ? (v | BIT(gpio)) : (v & ~BIT(gpio));
++	iowrite32(v, DBG_GPIO_DATA);
++}
++
++void dsl_n16_stage(unsigned int n);
++void dsl_n16_stage(unsigned int n)
++{
++	dbg_led(15, n & 1);
++	dbg_led(16, n & 2);
++	dbg_led(21, !(n & 4));	/* inverted: never looks like bootloader */
++}
++
++static void dbg_delay(void)
++{
++	volatile unsigned long i;
++
++	for (i = 0; i < 40000000; i++)
++		;
++}
++
++static void dsl_n16_hello(void)
++{
++	int i;
++
++	for (i = 0; i < 3; i++) {
++		dbg_led(15, 1); dbg_led(16, 1); dbg_led(21, 1);
++		dbg_delay();
++		dbg_led(15, 0); dbg_led(16, 0); dbg_led(21, 0);
++		dbg_delay();
++	}
++}
++
+ static void hw_reset(char *command)
+ {
+ 	iowrite32(RESET, CR_AHB_RSTCR);
+@@ -38,6 +66,8 @@
+ {
+ 	setup_8250_early_printk_port(UART_BASE, UART_REG_SHIFT, 0);
+ 	_machine_restart = hw_reset;
++	dsl_n16_hello();
++	dsl_n16_stage(1);
+ }
+ 
+ /* 2. Parse the DT and find memory */
+@@ -54,12 +83,14 @@
+ 	__dt_setup_arch(dtb);
+ 
+ 	early_init_dt_scan_memory();
++	dsl_n16_stage(2);
+ }
+ 
+ /* 3. Overload __weak device_tree_init(), register SMP ops */
+ void __init device_tree_init(void)
+ {
+ 	unflatten_and_copy_device_tree();
++	dsl_n16_stage(3);
+ 
+ 	/* EN7528 dual-core: probe CM/CPC and register CPS SMP ops */
+ 	mips_cm_probe();
+@@ -80,6 +111,7 @@
+ void __init arch_init_irq(void)
+ {
+ 	irqchip_init();
++	dsl_n16_stage(4);
+ }
+ 
+ /* 5. Timers */
+@@ -87,4 +119,23 @@
+ {
+ 	of_clk_init(NULL);
+ 	timer_probe();
++	dsl_n16_stage(5);
++}
++
++extern int econet_sfc_debug_ok;
++
++/* Stage 6 shows flash status instead: Power on, DSL = flash driver
++ * registered, Internet = squashfs magic readable at flash 0x420000. */
++static int __init dsl_n16_stage_late(void)
++{
++	void __iomem *w = ioremap(0x1c420000, 4);
++	int rootfs_ok = w && __raw_readl(w) == 0x68737173;
++
++	if (w)
++		iounmap(w);
++	dbg_led(21, 1);
++	dbg_led(15, econet_sfc_debug_ok & 1);
++	dbg_led(16, rootfs_ok && (econet_sfc_debug_ok & 2));
++	return 0;
+ }
++late_initcall_sync(dsl_n16_stage_late);
+diff --color -ru a/init/main.c b/init/main.c
+--- a/init/main.c	2026-11-05 10:36:28.452394471 +0300
++++ b/init/main.c	2026-11-05 10:36:28.464295009 +0300
+@@ -1455,6 +1455,8 @@
+ 	free_initmem_default(POISON_FREE_INITMEM);
+ }
+ 
++extern void dsl_n16_stage(unsigned int n);
++
+ static int __ref kernel_init(void *unused)
+ {
+ 	int ret;
+@@ -1487,6 +1489,8 @@
+ 
+ 	rcu_end_inkernel_boot();
+ 
++	dsl_n16_stage(7);
++
+ 	do_sysctl_args();
+ 
+ 	if (ramdisk_execute_command) {
+--- a/arch/mips/boot/compressed/decompress.c	2026-11-05 15:01:35.429463740 +0300
++++ b/arch/mips/boot/compressed/decompress.c	2026-11-05 15:01:35.437454145 +0300
+@@ -80,6 +80,9 @@
+ {
+ 	unsigned long zimage_start, zimage_size;
+ 
++	/* DSL-N16 bring-up debug: Power LED (GPIO21) off = zboot running */
++	*(volatile unsigned int *)0xbfbf0204 &= ~(1u << 21);
++
+ 	zimage_start = (unsigned long)(__image_begin);
+ 	zimage_size = (unsigned long)(__image_end) -
+ 	    (unsigned long)(__image_begin);

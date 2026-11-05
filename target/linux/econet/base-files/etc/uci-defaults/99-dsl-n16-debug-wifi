@@ -1,0 +1,15 @@
+# DSL-N16 bring-up DEBUG ONLY: open AP on lan so the box is reachable while
+# Ethernet does not work. Remove before committing.
+. /lib/functions.sh
+[ "$(board_name)" = "asus,dsl-n16" ] || exit 0
+# radio not detected yet: keep this script for the next boot
+uci -q get wireless.radio0 >/dev/null || exit 1
+uci -q batch <<EOT
+set wireless.radio0.disabled='0'
+set wireless.radio0.country='TR'
+set wireless.default_radio0.ssid='DSL-N16-debug'
+set wireless.default_radio0.encryption='none'
+set wireless.default_radio0.network='lan'
+commit wireless
+EOT
+exit 0

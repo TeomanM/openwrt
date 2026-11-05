@@ -50,6 +50,8 @@ struct econet_sfc {
 	struct mutex lock;
 };
 
+/* DSL-N16 bring-up debug: set when the flash is registered */
+int econet_sfc_debug_ok;
 
 
 static inline struct econet_sfc *mtd_to_sfc(struct mtd_info *mtd)
@@ -286,7 +288,9 @@ static int sfc_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, sfc);
 
-	return mtd_device_register(mtd, NULL, 0);
+	ret = mtd_device_register(mtd, NULL, 0);
+	econet_sfc_debug_ok = (ret ? 0 : 1) | (id_ok ? 2 : 0);
+	return ret;
 }
 
 static void sfc_remove(struct platform_device *pdev)

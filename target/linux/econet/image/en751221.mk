@@ -47,6 +47,7 @@ define Device/asus_dsl-n16
   # TRX at 0x20000, its 0x100 header, loader up to 0x30000, OKLI kernel at 0x30000
   LOADER_TRX_OFFS := 0x20100
   LOADER_FLASH_OFFS := 0x30000
+  LOADER_DEBUG_LED_GPIO := 15
   KERNEL := kernel-bin | append-dtb | lzma | uImage lzma -M 0x4f4b4c49 | \
     econet-okli-loader
   KERNEL_INITRAMFS := kernel-bin | append-dtb

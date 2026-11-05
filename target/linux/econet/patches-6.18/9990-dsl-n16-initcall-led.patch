@@ -1,0 +1,12 @@
+--- a/init/main.c	2026-11-05 15:18:14.439091130 +0300
++++ b/init/main.c	2026-11-05 15:18:14.447392046 +0300
+@@ -1260,6 +1260,9 @@
+ 	char msgbuf[64];
+ 	int ret;
+ 
++	/* DSL-N16 bring-up debug: toggle Internet LED (GPIO16) per initcall */
++	*(volatile unsigned int *)0xbfbf0204 ^= (1u << 16);
++
+ 	if (initcall_blacklisted(fn))
+ 		return -EPERM;
+ 
